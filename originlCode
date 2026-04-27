@@ -1,0 +1,271 @@
+#include <Servo.h>
+#include "IRremote.h"
+
+#define PIN_MOTOR_PWMA      5
+#define PIN_MOTOR_PWMB      6
+#define PIN_MOTOR_AIN1      7
+#define PIN_MOTOR_BIN1      8
+#define PIN_MOTOR_STBY      3
+
+#define PIN_TRIG           13
+#define PIN_ECHO           12
+
+#define PIN_SERVO_PAN      10
+#define PIN_SERVO_TILT     11
+
+#define PIN_IR_RECV         9
+
+#define IR_UP        0xFF629DUL
+#define IR_DOWN      0xFFA857UL
+#define IR_LEFT      0xFF22DDUL
+#define IR_RIGHT     0xFFC23DUL
+#define IR_OK        0xFF02FDUL
+#define IR_1         0xFF6897UL
+#define IR_2         0xFF9867UL
+#define IR_3         0xFFB04FUL
+#define IR_4         0xFF30CFUL
+
+const uint8_t  MOTOR_SPEED         = 180;
+const uint8_t  OBSTACLE_THRESHOLD  = 20;
+const uint16_t SERVO_SETTLE_MS     = 150;
+const uint8_t  TILT_STEP           = 5;
+const uint8_t  TILT_MIN            = 0;
+const uint8_t  TILT_MAX            = 180;
+const uint8_t  FOLLOW_TARGET_CM    = 30;
+const uint8_t  FOLLOW_DEADBAND_CM  = 4;
+const uint16_t FOLLOW_LOOP_MS      = 50;
+
+Servo panServo;
+Servo tiltServo;
+
+uint8_t tiltAngle    = 90;
+bool    obstacleMode = false;
+bool    followMode   = false;
+
+IRrecv         irrecv(PIN_IR_RECV);
+decode_results irResults;
+
+void motorStop() {
+  analogWrite(PIN_MOTOR_PWMA, 0);
+  analogWrite(PIN_MOTOR_PWMB, 0);
+  digitalWrite(PIN_MOTOR_STBY, LOW);
+}
+
+void motorForward(uint8_t speed) {
+  digitalWrite(PIN_MOTOR_STBY, HIGH);
+  digitalWrite(PIN_MOTOR_AIN1, HIGH);
+  digitalWrite(PIN_MOTOR_BIN1, HIGH);
+  analogWrite(PIN_MOTOR_PWMA, speed);
+  analogWrite(PIN_MOTOR_PWMB, speed);
+}
+
+void motorBackward(uint8_t speed) {
+  digitalWrite(PIN_MOTOR_STBY, HIGH);
+  digitalWrite(PIN_MOTOR_AIN1, LOW);
+  digitalWrite(PIN_MOTOR_BIN1, LOW);
+  analogWrite(PIN_MOTOR_PWMA, speed);
+  analogWrite(PIN_MOTOR_PWMB, speed);
+}
+
+void motorLeft(uint8_t speed) {
+  digitalWrite(PIN_MOTOR_STBY, HIGH);
+  digitalWrite(PIN_MOTOR_AIN1, HIGH);
+  digitalWrite(PIN_MOTOR_BIN1, LOW);
+  analogWrite(PIN_MOTOR_PWMA, speed);
+  analogWrite(PIN_MOTOR_PWMB, speed);
+}
+
+void motorRight(uint8_t speed) {
+  digitalWrite(PIN_MOTOR_STBY, HIGH);
+  digitalWrite(PIN_MOTOR_AIN1, LOW);
+  digitalWrite(PIN_MOTOR_BIN1, HIGH);
+  analogWrite(PIN_MOTOR_PWMA, speed);
+  analogWrite(PIN_MOTOR_PWMB, speed);
+}
+
+unsigned int readUltrasonicCM() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  unsigned long duration = pulseIn(PIN_ECHO, HIGH, 30000UL);
+  if (duration == 0) return 200;
+  unsigned long cm = duration / 58UL;
+  if (cm > 200) cm = 200;
+  return (unsigned int)cm;
+}
+
+void tiltUp() {
+  int newAngle = (int)tiltAngle + (int)TILT_STEP;
+  if (newAngle > TILT_MAX) newAngle = TILT_MAX;
+  tiltAngle = (uint8_t)newAngle;
+  tiltServo.write(tiltAngle);
+  Serial.print(F("Tilt up    -> "));
+  Serial.println(tiltAngle);
+}
+
+void tiltDown() {
+  int newAngle = (int)tiltAngle - (int)TILT_STEP;
+  if (newAngle < TILT_MIN) newAngle = TILT_MIN;
+  tiltAngle = (uint8_t)newAngle;
+  tiltServo.write(tiltAngle);
+  Serial.print(F("Tilt down  -> "));
+  Serial.println(tiltAngle);
+}
+
+void runObstacleAvoidance() {
+  static const uint8_t SCAN_ANGLES[5] = {0, 45, 90, 135, 180};
+  unsigned int distances[5];
+
+  motorStop();
+  delay(100);
+
+  for (uint8_t i = 0; i < 5; i++) {
+    panServo.write(SCAN_ANGLES[i]);
+    delay(SERVO_SETTLE_MS);
+    distances[i] = readUltrasonicCM();
+    Serial.print(F("  scan @ "));
+    Serial.print(SCAN_ANGLES[i]);
+    Serial.print(F(" deg = "));
+    Serial.print(distances[i]);
+    Serial.println(F(" cm"));
+  }
+
+  uint8_t bestIdx = 0;
+  for (uint8_t i = 1; i < 5; i++) {
+    if (distances[i] > distances[bestIdx]) bestIdx = i;
+  }
+  uint8_t      bestAngle = SCAN_ANGLES[bestIdx];
+  unsigned int bestDist  = distances[bestIdx];
+
+  Serial.print(F("  best   = "));
+  Serial.print(bestAngle);
+  Serial.print(F(" deg ("));
+  Serial.print(bestDist);
+  Serial.println(F(" cm)"));
+
+  panServo.write(90);
+  delay(80);
+
+  if (bestDist < OBSTACLE_THRESHOLD) {
+    Serial.println(F("  all blocked - backing up"));
+    motorBackward(MOTOR_SPEED);
+    delay(500);
+    motorStop();
+    return;
+  }
+
+  if (bestAngle < 90) {
+    motorLeft(MOTOR_SPEED);
+    delay((90 - bestAngle) * 5UL);
+    motorStop();
+  } else if (bestAngle > 90) {
+    motorRight(MOTOR_SPEED);
+    delay((bestAngle - 90) * 5UL);
+    motorStop();
+  }
+
+  motorForward(MOTOR_SPEED);
+  delay(500);
+  motorStop();
+}
+
+void runFollowMode() {
+  unsigned int d = readUltrasonicCM();
+  Serial.print(F("  follow d="));
+  Serial.print(d);
+  Serial.println(F(" cm"));
+
+  if (d >= 200) {
+    motorStop();
+    delay(FOLLOW_LOOP_MS);
+    return;
+  }
+
+  uint8_t upper = FOLLOW_TARGET_CM + FOLLOW_DEADBAND_CM;
+  uint8_t lower = FOLLOW_TARGET_CM - FOLLOW_DEADBAND_CM;
+
+  if (d > upper) {
+    motorForward(MOTOR_SPEED);
+  } else if (d < lower) {
+    motorBackward(MOTOR_SPEED);
+  } else {
+    motorStop();
+  }
+
+  delay(FOLLOW_LOOP_MS);
+}
+
+void handleIRCode(unsigned long code) {
+  switch (code) {
+    case IR_UP:    Serial.println(F("IR: forward"));  motorForward(MOTOR_SPEED);  break;
+    case IR_DOWN:  Serial.println(F("IR: backward")); motorBackward(MOTOR_SPEED); break;
+    case IR_LEFT:  Serial.println(F("IR: left"));     motorLeft(MOTOR_SPEED);     break;
+    case IR_RIGHT: Serial.println(F("IR: right"));    motorRight(MOTOR_SPEED);    break;
+    case IR_OK:
+      Serial.println(F("IR: stop"));
+      motorStop();
+      obstacleMode = false;
+      followMode   = false;
+      break;
+    case IR_1:     tiltUp();                                                      break;
+    case IR_2:     tiltDown();                                                    break;
+    case IR_3:
+      obstacleMode = !obstacleMode;
+      if (obstacleMode) followMode = false;
+      Serial.print(F("IR: obstacle mode -> "));
+      Serial.println(obstacleMode ? F("ON") : F("OFF"));
+      if (!obstacleMode) motorStop();
+      break;
+    case IR_4:
+      followMode = !followMode;
+      if (followMode) obstacleMode = false;
+      Serial.print(F("IR: follow mode   -> "));
+      Serial.println(followMode ? F("ON") : F("OFF"));
+      if (!followMode) motorStop();
+      break;
+    default:
+      Serial.print(F("IR: unknown code 0x"));
+      Serial.println(code, HEX);
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println(F("Cam Buddy starting..."));
+
+  pinMode(PIN_MOTOR_PWMA, OUTPUT);
+  pinMode(PIN_MOTOR_PWMB, OUTPUT);
+  pinMode(PIN_MOTOR_AIN1, OUTPUT);
+  pinMode(PIN_MOTOR_BIN1, OUTPUT);
+  pinMode(PIN_MOTOR_STBY, OUTPUT);
+  motorStop();
+
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+
+  panServo.attach(PIN_SERVO_PAN);
+  tiltServo.attach(PIN_SERVO_TILT);
+  panServo.write(90);
+  tiltServo.write(tiltAngle);
+
+  irrecv.enableIRIn();
+
+  Serial.println(F("Ready."));
+}
+
+void loop() {
+  if (obstacleMode) {
+    runObstacleAvoidance();
+  } else if (followMode) {
+    runFollowMode();
+  }
+
+  if (irrecv.decode(&irResults)) {
+    handleIRCode((unsigned long)irResults.value);
+    irrecv.resume();
+  }
+}
